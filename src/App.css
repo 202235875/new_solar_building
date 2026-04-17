@@ -1,0 +1,157 @@
+:root {
+  color: #14213d;
+  background: #f8fafc;
+  font-family: "Segoe UI", "Noto Sans KR", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: 14px;
+  cursor: pointer;
+  padding: 10px 14px;
+  background: #0f172a;
+  color: white;
+  font-weight: 700;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 380px 1fr;
+  min-height: 100vh;
+  color: #0f172a;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px;
+  background: #f8fafc;
+  border-right: 1px solid #e2e8f0;
+  overflow-y: auto;
+}
+
+.eyebrow {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #b45309;
+}
+
+h1, h2, h3 {
+  margin: 0;
+}
+
+.lead,
+.status-text,
+.empty-text {
+  line-height: 1.6;
+  color: #475569;
+}
+
+.panel {
+  padding: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  background: white;
+}
+
+.mode-row,
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.ghost-button {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.metric-list {
+  display: grid;
+  gap: 10px;
+}
+
+.single-column {
+  grid-template-columns: 1fr;
+}
+
+.metric-list div {
+  padding: 12px 13px;
+  border-radius: 16px;
+  background: #f8fafc;
+}
+
+.metric-list dt {
+  margin-bottom: 6px;
+  font-size: 0.84rem;
+  color: #64748b;
+}
+
+.metric-list dd {
+  margin: 0;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.result-panel {
+  margin-top: auto;
+}
+
+.map-stage {
+  position: relative;
+  min-height: 100vh;
+}
+
+.map-canvas {
+  width: 100%;
+  height: 100vh;
+}
+
+.loading-chip {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 1000;
+  background: white;
+  color: #0f172a;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.08);
+}
+
+.helper-text {
+  margin-top: 10px;
+  color: #64748b;
+  line-height: 1.5;
+  font-size: 0.92rem;
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .map-canvas {
+    height: 70vh;
+  }
+}

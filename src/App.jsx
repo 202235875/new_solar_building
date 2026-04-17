@@ -723,9 +723,6 @@ export default function App() {
           2023~2025년 실제 기상 데이터와 PR 시나리오를 바탕으로
           발전량·절감액·탄소 절감량을 비교합니다.
         </p>
-        <p className="helper-note">
-          전기요금 단가와 배출계수는 코드 상단 상수에서 바꿀 수 있어.
-        </p>
 
         <div className="panel">
           <h2>현재 상태</h2>

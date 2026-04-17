@@ -11,12 +11,15 @@ import "./App.css";
 
 const DEFAULT_CENTER = [37.45, 127.13];
 const DEFAULT_ZOOM = 18;
+const USABLE_RATIO = 0.55;
 
-const OVERPASS_ENDPOINTS = [
-  "/api/overpass/api/interpreter",
-  "https://overpass.private.coffee/api/interpreter",
-  "https://overpass-api.de/api/interpreter",
-];
+/*
+  아래 두 값은 사용자가 쉽게 바꿀 수 있게 둔 가정값이다.
+  - 전기요금 단가: 절감액 계산용
+  - 전력 배출계수: 탄소 절감량 계산용
+*/
+const DEFAULT_ELECTRICITY_PRICE_KRW_PER_KWH = 120;
+const DEFAULT_GRID_EMISSION_KGCO2_PER_KWH = 0.45;
 
 function getArea(coords) {
   if (!coords || coords.length < 3) return 0;
@@ -31,7 +34,7 @@ function getArea(coords) {
   ]);
 
   let area = 0;
-  for (let i = 0; i < pts.length; i++) {
+  for (let i = 0; i < pts.length; i += 1) {
     const [x1, y1] = pts[i];
     const [x2, y2] = pts[(i + 1) % pts.length];
     area += x1 * y2 - x2 * y1;
@@ -46,12 +49,6 @@ function getCentroid(coords) {
   return [lat, lng];
 }
 
-function getDistanceSquared(aLat, aLng, bLat, bLng) {
-  const dLat = aLat - bLat;
-  const dLng = aLng - bLng;
-  return dLat * dLat + dLng * dLng;
-}
-
 function formatNumber(value, digits = 0) {
   return new Intl.NumberFormat("ko-KR", {
     maximumFractionDigits: digits,
@@ -59,8 +56,8 @@ function formatNumber(value, digits = 0) {
   }).format(value);
 }
 
-function estimateSolar(area) {
-  const usableArea = area * 0.72;
+function estimateSimpleSolar(area) {
+  const usableArea = area * USABLE_RATIO;
   const capacityKw = usableArea / 5.5;
   const annualGeneration = capacityKw * 1250 * 0.86;
 
@@ -72,31 +69,93 @@ function estimateSolar(area) {
   };
 }
 
-async function fetchOverpassWithFallback(query) {
-  let lastError = null;
+function addEconomicAndCarbonMetrics(result) {
+  const annualSavingsKRW =
+    result.annualGenerationKWh * DEFAULT_ELECTRICITY_PRICE_KRW_PER_KWH;
+  const monthlySavingsKRW = annualSavingsKRW / 12;
 
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        body: query,
-      });
+  const annualCarbonReductionKg =
+    result.annualGenerationKWh * DEFAULT_GRID_EMISSION_KGCO2_PER_KWH;
+  const annualCarbonReductionTon = annualCarbonReductionKg / 1000;
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} @ ${endpoint}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      console.error("Overpass 실패:", endpoint, error);
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error("모든 Overpass 서버 요청 실패");
+  return {
+    ...result,
+    annualSavingsKRW,
+    monthlySavingsKRW,
+    annualCarbonReductionKg,
+    annualCarbonReductionTon,
+  };
 }
 
-function MapWatcher({ onViewportChange, onMapClick, disabled }) {
+async function fetchSolarWeatherByYear({
+  latitude,
+  longitude,
+  year,
+  tilt = 30,
+  azimuth = 0,
+}) {
+  const url =
+    `https://archive-api.open-meteo.com/v1/archive` +
+    `?latitude=${latitude}` +
+    `&longitude=${longitude}` +
+    `&start_date=${year}-01-01` +
+    `&end_date=${year}-12-31` +
+    `&hourly=global_tilted_irradiance,temperature_2m` +
+    `&tilt=${tilt}` +
+    `&azimuth=${azimuth}` +
+    `&timezone=Asia%2FSeoul`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`${year}년 기상 데이터를 불러오지 못했습니다.`);
+  }
+
+  return await response.json();
+}
+
+function calculateSolarFromWeather({
+  areaM2,
+  weatherData,
+  panelEfficiency = 0.2,
+  performanceRatio = 0.86,
+  tempCoeff = 0.004,
+  usableRatio = USABLE_RATIO,
+}) {
+  const irradiation = weatherData?.hourly?.global_tilted_irradiance ?? [];
+  const temperature = weatherData?.hourly?.temperature_2m ?? [];
+
+  const usableArea = areaM2 * usableRatio;
+
+  let annualGenerationKWh = 0;
+
+  for (let i = 0; i < irradiation.length; i += 1) {
+    const gti = irradiation[i] ?? 0;
+    const temp = temperature[i] ?? 25;
+    const tempFactor = Math.max(0, 1 - tempCoeff * (temp - 25));
+
+    const hourlyKWh =
+      (gti * usableArea * panelEfficiency * performanceRatio * tempFactor) /
+      1000;
+
+    annualGenerationKWh += hourlyKWh;
+  }
+
+  const installedCapacityKw = usableArea / 5.5;
+  const specificYield =
+    installedCapacityKw > 0
+      ? annualGenerationKWh / installedCapacityKw
+      : 0;
+
+  return {
+    usableArea,
+    installedCapacityKw,
+    annualGenerationKWh,
+    monthlyAverageKWh: annualGenerationKWh / 12,
+    specificYield,
+  };
+}
+
+function MapWatcher({ onViewportChange, onMapClick }) {
   useMapEvents({
     moveend(e) {
       const map = e.target;
@@ -131,7 +190,6 @@ function MapWatcher({ onViewportChange, onMapClick, disabled }) {
       });
     },
     click(e) {
-      if (disabled) return;
       onMapClick(e.latlng.lat, e.latlng.lng);
     },
   });
@@ -140,120 +198,57 @@ function MapWatcher({ onViewportChange, onMapClick, disabled }) {
 }
 
 export default function App() {
-  const [mode, setMode] = useState("auto");
   const [viewport, setViewport] = useState({
     center: DEFAULT_CENTER,
     zoom: DEFAULT_ZOOM,
     bounds: null,
   });
 
-  const [selectedBuilding, setSelectedBuilding] = useState(null);
   const [drawPoints, setDrawPoints] = useState([]);
-  const [isLoadingBuilding, setIsLoadingBuilding] = useState(false);
-  const [cooldown, setCooldown] = useState(false);
+  const [selectedBuilding, setSelectedBuilding] = useState(null);
   const [status, setStatus] = useState(
-    "모드를 고른 뒤 지도를 이동해서 건물을 선택하세요."
+    "건물 꼭짓점을 순서대로 클릭하세요. 점 3개 이상이면 폴리곤 완성이 가능합니다."
   );
 
-  async function loadNearestBuilding(lat, lng) {
-    if (mode !== "auto") return;
-    if (isLoadingBuilding) return;
-
-    if (cooldown) {
-      setStatus("잠깐만 기다려... 3초 뒤 다시 시도해줘");
-      return;
-    }
-
-    if (viewport.zoom < 18) {
-      setStatus("자동 선택은 더 확대한 뒤 건물 중앙을 클릭해야 해. 권장 줌은 18 이상이야.");
-      return;
-    }
-
-    setIsLoadingBuilding(true);
-    setStatus("클릭한 위치 근처의 건물을 찾는 중입니다...");
-    setDrawPoints([]);
-
-    try {
-      const overpassQuery = `
-        [out:json][timeout:8];
-        (
-          way["building"](around:15,${lat},${lng});
-        );
-        out tags geom;
-      `;
-
-      const payload = await fetchOverpassWithFallback(overpassQuery);
-
-      const candidates = (payload.elements || [])
-        .filter((el) => Array.isArray(el.geometry) && el.geometry.length >= 3)
-        .map((el) => {
-          const coords = el.geometry.map((point) => [point.lat, point.lon]);
-          const area = getArea(coords);
-          const [cLat, cLng] = getCentroid(coords);
-
-          return {
-            id: el.id,
-            name: el.tags?.name || el.tags?.building || `건물 ${el.id}`,
-            levels: el.tags?.["building:levels"] || "정보 없음",
-            type: el.tags?.building || "building",
-            coords,
-            area,
-            distanceScore: getDistanceSquared(lat, lng, cLat, cLng),
-            source: "auto",
-          };
-        })
-        .filter((building) => building.area >= 15)
-        .sort((a, b) => a.distanceScore - b.distanceScore);
-
-      if (!candidates.length) {
-        setStatus("이 위치 근처에서 건물을 찾지 못했습니다. 건물 중앙을 다시 클릭해 보세요.");
-        return;
-      }
-
-      setSelectedBuilding(candidates[0]);
-      setStatus("자동 선택으로 건물 1개를 찾았습니다.");
-    } catch (error) {
-      console.error(error);
-      setStatus("건물 서버가 바쁘거나 응답이 느립니다. 잠시 후 다시 시도하세요.");
-    } finally {
-      setIsLoadingBuilding(false);
-      setCooldown(true);
-      setTimeout(() => setCooldown(false), 3000);
-    }
-  }
-
-  function handleDrawPoint(lat, lng) {
-    if (mode !== "draw") return;
-    setSelectedBuilding(null);
-
-    setDrawPoints((prev) => {
-      if (prev.length >= 8) {
-        setStatus("점은 최대 8개까지 찍을 수 있어. 필요하면 초기화하고 다시 그려줘.");
-        return prev;
-      }
-      const next = [...prev, [lat, lng]];
-      setStatus(`점 ${next.length}개를 찍었어. 3개 이상이면 폴리곤 계산 가능.`);
-      return next;
-    });
-  }
+  const [multiYearResult, setMultiYearResult] = useState(null);
+  const [isLoadingWeather, setIsLoadingWeather] = useState(false);
 
   function handleMapClick(lat, lng) {
-    if (mode === "auto") {
-      loadNearestBuilding(lat, lng);
-    } else {
-      handleDrawPoint(lat, lng);
-    }
+    setSelectedBuilding(null);
+    setMultiYearResult(null);
+
+    setDrawPoints((prev) => {
+      const next = [...prev, [lat, lng]];
+      setStatus(
+        `점 ${next.length}개를 찍었습니다. 3개 이상이면 폴리곤 완성이 가능합니다.`
+      );
+      return next;
+    });
   }
 
   function clearDrawing() {
     setDrawPoints([]);
     setSelectedBuilding(null);
-    setStatus("직접 그리기 점을 초기화했어.");
+    setMultiYearResult(null);
+    setStatus("초기화했습니다. 다시 건물 꼭짓점을 클릭하세요.");
+  }
+
+  function undoLastPoint() {
+    setDrawPoints((prev) => {
+      if (prev.length === 0) return prev;
+      const next = prev.slice(0, -1);
+      setStatus(
+        `마지막 점을 지웠습니다. 현재 ${next.length}개 점이 남아 있습니다.`
+      );
+      return next;
+    });
+    setSelectedBuilding(null);
+    setMultiYearResult(null);
   }
 
   function completeDrawing() {
     if (drawPoints.length < 3) {
-      setStatus("직접 그리기는 점 3개 이상이 필요해.");
+      setStatus("점 3개 이상이 필요합니다.");
       return;
     }
 
@@ -262,64 +257,479 @@ export default function App() {
     setSelectedBuilding({
       id: "manual-drawing",
       name: "직접 그린 건물",
-      levels: "직접 지정 안 함",
-      type: "manual",
       coords: drawPoints,
       area,
       source: "manual",
     });
 
-    setStatus("직접 그린 건물 폴리곤을 계산했어.");
+    setMultiYearResult(null);
+    setStatus(
+      "폴리곤 계산이 완료되었습니다. 이제 3개년 평균 + PR 시나리오 계산을 실행할 수 있습니다."
+    );
   }
 
-  const estimate = selectedBuilding ? estimateSolar(selectedBuilding.area) : null;
+  async function analyzeWithMultiYearWeather() {
+    if (!selectedBuilding) {
+      setStatus("먼저 폴리곤을 완성하세요.");
+      return;
+    }
+
+    setIsLoadingWeather(true);
+    setStatus("2023~2025년 실제 날씨 데이터와 PR 시나리오를 계산하는 중입니다...");
+
+    try {
+      const [lat, lng] = getCentroid(selectedBuilding.coords);
+
+      const years = [2023, 2024, 2025];
+      const prScenarios = [
+        { label: "보수적", value: 0.75 },
+        { label: "기준", value: 0.8 },
+        { label: "낙관적", value: 0.86 },
+      ];
+
+      const weatherByYear = {};
+      for (const year of years) {
+        weatherByYear[year] = await fetchSolarWeatherByYear({
+          latitude: lat,
+          longitude: lng,
+          year,
+          tilt: 30,
+          azimuth: 0,
+        });
+      }
+
+      const scenarioResults = prScenarios.map((scenario) => {
+        const yearly = years.map((year) => {
+          const result = calculateSolarFromWeather({
+            areaM2: selectedBuilding.area,
+            weatherData: weatherByYear[year],
+            panelEfficiency: 0.2,
+            performanceRatio: scenario.value,
+            tempCoeff: 0.004,
+            usableRatio: USABLE_RATIO,
+          });
+
+          return addEconomicAndCarbonMetrics({
+            year,
+            annualGenerationKWh: result.annualGenerationKWh,
+            monthlyAverageKWh: result.monthlyAverageKWh,
+            specificYield: result.specificYield,
+            installedCapacityKw: result.installedCapacityKw,
+            usableArea: result.usableArea,
+          });
+        });
+
+        const avgAnnualGenerationKWh =
+          yearly.reduce((sum, item) => sum + item.annualGenerationKWh, 0) /
+          yearly.length;
+
+        const avgMonthlyGenerationKWh =
+          yearly.reduce((sum, item) => sum + item.monthlyAverageKWh, 0) /
+          yearly.length;
+
+        const avgSpecificYield =
+          yearly.reduce((sum, item) => sum + item.specificYield, 0) /
+          yearly.length;
+
+        const avgAnnualSavingsKRW =
+          yearly.reduce((sum, item) => sum + item.annualSavingsKRW, 0) /
+          yearly.length;
+
+        const avgMonthlySavingsKRW =
+          yearly.reduce((sum, item) => sum + item.monthlySavingsKRW, 0) /
+          yearly.length;
+
+        const avgAnnualCarbonReductionTon =
+          yearly.reduce((sum, item) => sum + item.annualCarbonReductionTon, 0) /
+          yearly.length;
+
+        return {
+          label: scenario.label,
+          pr: scenario.value,
+          yearly,
+          avgAnnualGenerationKWh,
+          avgMonthlyGenerationKWh,
+          avgSpecificYield,
+          avgAnnualSavingsKRW,
+          avgMonthlySavingsKRW,
+          avgAnnualCarbonReductionTon,
+          installedCapacityKw: yearly[0].installedCapacityKw,
+          usableArea: yearly[0].usableArea,
+        };
+      });
+
+      setMultiYearResult({
+        years,
+        scenarios: scenarioResults,
+      });
+
+      setStatus("2023~2025년 3개년 평균 및 PR 시나리오 계산이 완료되었습니다.");
+    } catch (error) {
+      console.error(error);
+      setStatus("3개년 날씨 기반 계산에 실패했습니다.");
+    } finally {
+      setIsLoadingWeather(false);
+    }
+  }
+
+  function openResultWindow() {
+    if (!selectedBuilding) {
+      setStatus("먼저 폴리곤을 완성하세요.");
+      return;
+    }
+
+    const popup = window.open("", "_blank", "width=1280,height=920");
+    if (!popup) {
+      setStatus("팝업이 차단되었습니다. 브라우저에서 팝업을 허용해 주세요.");
+      return;
+    }
+
+    const simple = addEconomicAndCarbonMetrics({
+      ...estimateSimpleSolar(selectedBuilding.area),
+      annualGenerationKWh: estimateSimpleSolar(selectedBuilding.area).annualGeneration,
+    });
+
+    const polygonCoordsText = JSON.stringify(selectedBuilding.coords);
+
+    const scenarioHtml = multiYearResult
+      ? multiYearResult.scenarios
+          .map((scenario) => {
+            const yearlyRows = scenario.yearly
+              .map(
+                (item) => `
+                  <tr>
+                    <td>${item.year}년</td>
+                    <td>${formatNumber(item.annualGenerationKWh)} kWh</td>
+                    <td>${formatNumber(item.annualSavingsKRW)} 원</td>
+                    <td>${formatNumber(item.annualCarbonReductionTon, 2)} tCO₂</td>
+                  </tr>
+                `
+              )
+              .join("");
+
+            return `
+              <section class="scenario-card">
+                <div class="scenario-label">${scenario.label} 시나리오 · PR ${scenario.pr}</div>
+
+                <div class="grid">
+                  <div class="card">
+                    <div class="label">설치 가능 면적</div>
+                    <div class="value">${formatNumber(scenario.usableArea)} ㎡</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">예상 설비 용량</div>
+                    <div class="value">${formatNumber(scenario.installedCapacityKw, 1)} kW</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 연간 발전량</div>
+                    <div class="value">${formatNumber(scenario.avgAnnualGenerationKWh)} kWh</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 월평균 발전량</div>
+                    <div class="value">${formatNumber(scenario.avgMonthlyGenerationKWh)} kWh</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 연간 절감액</div>
+                    <div class="value">${formatNumber(scenario.avgAnnualSavingsKRW)} 원</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 월 절감액</div>
+                    <div class="value">${formatNumber(scenario.avgMonthlySavingsKRW)} 원</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 특정수율</div>
+                    <div class="value">${formatNumber(scenario.avgSpecificYield, 1)} kWh/kW·year</div>
+                  </div>
+                  <div class="card">
+                    <div class="label">3개년 평균 연간 탄소 절감량</div>
+                    <div class="value">${formatNumber(scenario.avgAnnualCarbonReductionTon, 2)} tCO₂</div>
+                  </div>
+                </div>
+
+                <table>
+                  <thead>
+                    <tr>
+                      <th>연도</th>
+                      <th>연간 발전량</th>
+                      <th>연간 절감액</th>
+                      <th>연간 탄소 절감량</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${yearlyRows}
+                  </tbody>
+                </table>
+              </section>
+            `;
+          })
+          .join("")
+      : `<p class="empty">아직 3개년 평균 + PR 시나리오 계산을 실행하지 않았습니다.</p>`;
+
+    popup.document.write(`
+      <!DOCTYPE html>
+      <html lang="ko">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>태양광 분석 결과</title>
+        <link
+          rel="stylesheet"
+          href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        />
+        <style>
+          body {
+            margin: 0;
+            font-family: "Segoe UI", "Noto Sans KR", sans-serif;
+            background: #f8fafc;
+            color: #0f172a;
+          }
+          .topbar {
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            padding: 16px 24px;
+            background: rgba(255,255,255,0.92);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid #e2e8f0;
+          }
+          .print-btn {
+            border: 0;
+            border-radius: 12px;
+            padding: 10px 14px;
+            background: #0f172a;
+            color: white;
+            font-weight: 700;
+            cursor: pointer;
+          }
+          .wrap {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+          }
+          h1 {
+            margin: 0 0 10px;
+            font-size: 2rem;
+          }
+          h2 {
+            margin: 0 0 14px;
+            font-size: 1.25rem;
+          }
+          .lead {
+            color: #475569;
+            line-height: 1.6;
+            margin-bottom: 24px;
+          }
+          .meta {
+            color: #64748b;
+            font-size: 0.92rem;
+            margin-top: 8px;
+          }
+          .section {
+            background: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 20px;
+          }
+          .grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+          }
+          .card {
+            background: #f8fafc;
+            border-radius: 14px;
+            padding: 14px;
+          }
+          .label {
+            font-size: 0.82rem;
+            color: #64748b;
+            margin-bottom: 6px;
+          }
+          .value {
+            font-size: 1.05rem;
+            font-weight: 800;
+          }
+          #resultMap {
+            width: 100%;
+            height: 480px;
+            border-radius: 18px;
+            overflow: hidden;
+          }
+          .scenario-card {
+            border: 1px solid #dbeafe;
+            border-radius: 18px;
+            padding: 16px;
+            margin-bottom: 16px;
+            background: #eff6ff;
+          }
+          .scenario-label {
+            display: inline-block;
+            margin-bottom: 12px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: #dbeafe;
+            color: #1d4ed8;
+            font-size: 0.85rem;
+            font-weight: 800;
+          }
+          table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 14px;
+          }
+          th, td {
+            border-bottom: 1px solid #e2e8f0;
+            text-align: left;
+            padding: 10px 8px;
+            font-size: 0.95rem;
+          }
+          th {
+            background: #f8fafc;
+          }
+          .empty {
+            color: #64748b;
+          }
+          @media print {
+            .topbar {
+              display: none;
+            }
+            body {
+              background: white;
+            }
+            .section {
+              box-shadow: none;
+              break-inside: avoid;
+            }
+          }
+          @media (max-width: 800px) {
+            .grid {
+              grid-template-columns: 1fr;
+            }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="topbar">
+          <div><strong>태양광 분석 결과 보고서</strong></div>
+          <button class="print-btn" onclick="window.print()">인쇄 / PDF 저장</button>
+        </div>
+
+        <div class="wrap">
+          <h1>태양광 분석 결과</h1>
+          <p class="lead">
+            사용자가 직접 선택한 폴리곤을 기준으로 계산한 기본 결과와
+            2023~2025년 실제 기상 데이터 기반 3개년 평균 + PR 시나리오 분석 결과입니다.
+          </p>
+          <div class="meta">
+            전기요금 절감액 계산 가정: ${formatNumber(DEFAULT_ELECTRICITY_PRICE_KRW_PER_KWH)} 원/kWh<br />
+            탄소 절감량 계산 가정: ${formatNumber(DEFAULT_GRID_EMISSION_KGCO2_PER_KWH, 3)} kgCO₂/kWh
+          </div>
+
+          <section class="section">
+            <h2>선택한 폴리곤 지도</h2>
+            <div id="resultMap"></div>
+          </section>
+
+          <section class="section">
+            <h2>기본 계산 결과</h2>
+            <div class="grid">
+              <div class="card">
+                <div class="label">건물 면적</div>
+                <div class="value">${formatNumber(simple.roofArea)} ㎡</div>
+              </div>
+              <div class="card">
+                <div class="label">설치 가능 면적</div>
+                <div class="value">${formatNumber(simple.usableArea)} ㎡</div>
+              </div>
+              <div class="card">
+                <div class="label">예상 설비 용량</div>
+                <div class="value">${formatNumber(simple.capacityKw, 1)} kW</div>
+              </div>
+              <div class="card">
+                <div class="label">연간 예상 발전량</div>
+                <div class="value">${formatNumber(simple.annualGeneration)} kWh</div>
+              </div>
+              <div class="card">
+                <div class="label">연간 예상 전기요금 절감액</div>
+                <div class="value">${formatNumber(simple.annualSavingsKRW)} 원</div>
+              </div>
+              <div class="card">
+                <div class="label">연간 예상 탄소 절감량</div>
+                <div class="value">${formatNumber(simple.annualCarbonReductionTon, 2)} tCO₂</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="section">
+            <h2>3개년 평균 + PR 시나리오 결과</h2>
+            ${scenarioHtml}
+          </section>
+        </div>
+
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+          const coords = ${polygonCoordsText};
+          const centerLat =
+            coords.reduce((sum, p) => sum + p[0], 0) / coords.length;
+          const centerLng =
+            coords.reduce((sum, p) => sum + p[1], 0) / coords.length;
+
+          const map = L.map("resultMap").setView([centerLat, centerLng], 19);
+
+          L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 20,
+            attribution: "&copy; OpenStreetMap contributors"
+          }).addTo(map);
+
+          const polygon = L.polygon(coords, {
+            color: "#f97316",
+            weight: 3,
+            fillColor: "#fb923c",
+            fillOpacity: 0.45
+          }).addTo(map);
+
+          map.fitBounds(polygon.getBounds(), { padding: [20, 20] });
+        </script>
+      </body>
+      </html>
+    `);
+
+    popup.document.close();
+  }
+
+  const simpleEstimate = selectedBuilding
+    ? estimateSimpleSolar(selectedBuilding.area)
+    : null;
+
+  const simpleWithExtra = simpleEstimate
+    ? addEconomicAndCarbonMetrics({
+        ...simpleEstimate,
+        annualGenerationKWh: simpleEstimate.annualGeneration,
+      })
+    : null;
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <p className="eyebrow">SMART SOLAR 2</p>
-        <h1>건물 선택 태양광 지도</h1>
+        <h1>태양광 잠재량 분석 지도</h1>
         <p className="lead">
-          자동 선택과 직접 그리기 두 가지 방식으로 건물을 지정할 수 있어.
+          건물 꼭짓점을 직접 선택해 면적을 계산하고,
+          2023~2025년 실제 기상 데이터와 PR 시나리오를 바탕으로
+          발전량·절감액·탄소 절감량을 비교합니다.
         </p>
-
-        <div className="panel">
-          <h2>모드 선택</h2>
-          <div className="mode-row">
-            <button
-              onClick={() => {
-                setMode("auto");
-                setDrawPoints([]);
-                setSelectedBuilding(null);
-                setStatus("자동 선택 모드야. 건물 중앙을 클릭해.");
-              }}
-            >
-              자동 선택
-            </button>
-            <button
-              className="ghost-button"
-              onClick={() => {
-                setMode("draw");
-                setDrawPoints([]);
-                setSelectedBuilding(null);
-                setStatus("직접 그리기 모드야. 건물 꼭짓점을 순서대로 클릭해.");
-              }}
-            >
-              직접 그리기
-            </button>
-          </div>
-          <p className="helper-text">
-            자동 선택은 편하지만 서버가 불안정할 수 있고, 직접 그리기는 가장 안정적이야.
-          </p>
-        </div>
+        <p className="helper-note">
+          전기요금 단가와 배출계수는 코드 상단 상수에서 바꿀 수 있어.
+        </p>
 
         <div className="panel">
           <h2>현재 상태</h2>
           <dl className="metric-list single-column">
-            <div>
-              <dt>현재 모드</dt>
-              <dd>{mode === "auto" ? "자동 선택" : "직접 그리기"}</dd>
-            </div>
             <div>
               <dt>현재 중심</dt>
               <dd>
@@ -330,72 +740,166 @@ export default function App() {
               <dt>현재 줌</dt>
               <dd>{viewport.zoom}</dd>
             </div>
-            {mode === "draw" && (
-              <div>
-                <dt>찍은 점 개수</dt>
-                <dd>{drawPoints.length}</dd>
-              </div>
-            )}
+            <div>
+              <dt>찍은 점 개수</dt>
+              <dd>{drawPoints.length}</dd>
+            </div>
           </dl>
+
           <p className="status-text">{status}</p>
 
-          {mode === "draw" && (
-            <div className="action-row">
-              <button onClick={completeDrawing}>폴리곤 완성</button>
-              <button className="ghost-button" onClick={clearDrawing}>
-                초기화
-              </button>
-            </div>
+          <div className="action-row">
+            <button onClick={completeDrawing}>폴리곤 완성</button>
+            <button className="ghost-button" onClick={undoLastPoint}>
+              마지막 점 지우기
+            </button>
+            <button className="ghost-button" onClick={clearDrawing}>
+              초기화
+            </button>
+          </div>
+        </div>
+
+        <div className="panel">
+          <h2>기본 계산 결과</h2>
+
+          {!selectedBuilding && (
+            <p className="empty-text">
+              건물 모서리를 순서대로 클릭한 뒤, 폴리곤 완성을 눌러주세요.
+            </p>
+          )}
+
+          {selectedBuilding && simpleWithExtra && (
+            <dl className="metric-list single-column">
+              <div>
+                <dt>건물 면적</dt>
+                <dd className="big-number">
+                  {formatNumber(simpleWithExtra.roofArea)} ㎡
+                </dd>
+              </div>
+              <div>
+                <dt>설치 가능 면적</dt>
+                <dd>{formatNumber(simpleWithExtra.usableArea)} ㎡</dd>
+              </div>
+              <div>
+                <dt>예상 설비 용량</dt>
+                <dd>{formatNumber(simpleWithExtra.capacityKw, 1)} kW</dd>
+              </div>
+              <div>
+                <dt>연간 예상 발전량</dt>
+                <dd>{formatNumber(simpleWithExtra.annualGeneration)} kWh</dd>
+              </div>
+              <div>
+                <dt>연간 예상 전기요금 절감액</dt>
+                <dd>{formatNumber(simpleWithExtra.annualSavingsKRW)} 원</dd>
+              </div>
+              <div>
+                <dt>연간 예상 탄소 절감량</dt>
+                <dd>{formatNumber(simpleWithExtra.annualCarbonReductionTon, 2)} tCO₂</dd>
+              </div>
+            </dl>
           )}
         </div>
 
         <div className="panel result-panel">
-          <h2>{selectedBuilding ? selectedBuilding.name : "건물을 선택하세요"}</h2>
+          <div className="panel-header">
+            <h2>3개년 평균 + PR 시나리오</h2>
+            <div className="action-row">
+              <button
+                onClick={analyzeWithMultiYearWeather}
+                disabled={isLoadingWeather}
+              >
+                {isLoadingWeather ? "계산 중..." : "3개년 평균 + PR 시나리오 계산"}
+              </button>
+              <button className="ghost-button" onClick={openResultWindow}>
+                결과 새 창으로 보기
+              </button>
+            </div>
+          </div>
 
-          {!selectedBuilding && (
+          {!multiYearResult && (
             <p className="empty-text">
-              자동 선택에서는 건물 중앙 클릭, 직접 그리기에서는 점을 3개 이상 찍은 뒤 폴리곤 완성을 누르면 돼.
+              폴리곤을 완성한 뒤 버튼을 누르면 2023~2025년 실제 기상 데이터와
+              PR 3개 시나리오를 바탕으로 계산합니다.
             </p>
           )}
 
-          {selectedBuilding && estimate && (
-            <dl className="metric-list single-column">
-              <div>
-                <dt>선택 방식</dt>
-                <dd>{selectedBuilding.source === "auto" ? "자동 선택" : "직접 그리기"}</dd>
-              </div>
-              <div>
-                <dt>건물 유형</dt>
-                <dd>{selectedBuilding.type}</dd>
-              </div>
-              <div>
-                <dt>층수</dt>
-                <dd>{selectedBuilding.levels}</dd>
-              </div>
-              <div>
-                <dt>건물 면적</dt>
-                <dd>{formatNumber(estimate.roofArea)} ㎡</dd>
-              </div>
-              <div>
-                <dt>설치 가능 면적</dt>
-                <dd>{formatNumber(estimate.usableArea)} ㎡</dd>
-              </div>
-              <div>
-                <dt>예상 설비 용량</dt>
-                <dd>{formatNumber(estimate.capacityKw, 1)} kW</dd>
-              </div>
-              <div>
-                <dt>연간 예상 발전량</dt>
-                <dd>{formatNumber(estimate.annualGeneration)} kWh</dd>
-              </div>
-            </dl>
+          {multiYearResult && (
+            <>
+              {multiYearResult.scenarios.map((scenario) => {
+                const cardClass =
+                  scenario.label === "보수적"
+                    ? "scenario-card conservative"
+                    : scenario.label === "기준"
+                    ? "scenario-card standard"
+                    : "scenario-card optimistic";
+
+                return (
+                  <div key={scenario.label} className={cardClass}>
+                    <div className="scenario-label">
+                      {scenario.label} 시나리오 · PR {scenario.pr}
+                    </div>
+
+                    <dl className="metric-list single-column">
+                      <div>
+                        <dt>설치 가능 면적</dt>
+                        <dd>{formatNumber(scenario.usableArea)} ㎡</dd>
+                      </div>
+                      <div>
+                        <dt>예상 설비 용량</dt>
+                        <dd>{formatNumber(scenario.installedCapacityKw, 1)} kW</dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 연간 발전량</dt>
+                        <dd className="big-number">
+                          {formatNumber(scenario.avgAnnualGenerationKWh)} kWh
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 월평균 발전량</dt>
+                        <dd>{formatNumber(scenario.avgMonthlyGenerationKWh)} kWh</dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 특정수율</dt>
+                        <dd>
+                          {formatNumber(scenario.avgSpecificYield, 1)} kWh/kW·year
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 연간 절감액</dt>
+                        <dd>{formatNumber(scenario.avgAnnualSavingsKRW)} 원</dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 월 절감액</dt>
+                        <dd>{formatNumber(scenario.avgMonthlySavingsKRW)} 원</dd>
+                      </div>
+                      <div>
+                        <dt>3개년 평균 연간 탄소 절감량</dt>
+                        <dd>{formatNumber(scenario.avgAnnualCarbonReductionTon, 2)} tCO₂</dd>
+                      </div>
+
+                      {scenario.yearly.map((item) => (
+                        <div key={item.year}>
+                          <dt>{item.year}년 연간 발전량</dt>
+                          <dd>{formatNumber(item.annualGenerationKWh)} kWh</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  </div>
+                );
+              })}
+
+              <p className="helper-note">
+                보수적·기준·낙관적 시나리오는 성능비(PR)를 다르게 두어
+                실제 운영 조건 차이에 따른 발전량·절감액·탄소 절감량 범위를 비교한 값이야.
+              </p>
+            </>
           )}
         </div>
       </aside>
 
       <main className="map-stage">
-        {isLoadingBuilding && (
-          <div className="loading-chip">건물 찾는 중...</div>
+        {isLoadingWeather && (
+          <div className="loading-chip">3개년 날씨 데이터 계산 중...</div>
         )}
 
         <MapContainer
@@ -413,12 +917,14 @@ export default function App() {
           <MapWatcher
             onViewportChange={setViewport}
             onMapClick={handleMapClick}
-            disabled={isLoadingBuilding}
           />
 
-          {mode === "draw" && drawPoints.length > 0 && (
+          {drawPoints.length > 0 && (
             <>
-              <Polyline positions={drawPoints} pathOptions={{ color: "#2563eb", weight: 3 }} />
+              <Polyline
+                positions={drawPoints}
+                pathOptions={{ color: "#2563eb", weight: 3 }}
+              />
               {drawPoints.length >= 3 && (
                 <Polygon
                   positions={drawPoints}
